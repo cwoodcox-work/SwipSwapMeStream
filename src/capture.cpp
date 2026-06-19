@@ -66,6 +66,28 @@
 
 namespace {
 
+    // WHBLogUdp is not thread-safe and several of our threads log; serialize all
+    // of this plugin's logging behind one mutex so concurrent log calls can't
+    // corrupt the logger (which previously hung the console). __LINE__/__FUNCTION__
+    // still resolve to the call site since these are macros.
+    std::mutex sLogMutex;
+#define STREAM_LOG_INFO(...)                              \
+    do {                                                  \
+        std::lock_guard<std::mutex> _llk(sLogMutex);      \
+        DEBUG_FUNCTION_LINE_INFO(__VA_ARGS__);            \
+    } while (0)
+#define STREAM_LOG_WARN(...)                              \
+    do {                                                  \
+        std::lock_guard<std::mutex> _llk(sLogMutex);      \
+        DEBUG_FUNCTION_LINE_WARN(__VA_ARGS__);            \
+    } while (0)
+#define STREAM_LOG_ERR(...)                               \
+    do {                                                  \
+        std::lock_guard<std::mutex> _llk(sLogMutex);      \
+        DEBUG_FUNCTION_LINE_ERR(__VA_ARGS__);             \
+    } while (0)
+
+
     // Clamp the configured strip count to [1, 3] (the Espresso has 3 cores).
     constexpr int kNumStrips = STREAM_ENCODE_STRIPS < 1 ? 1
                                : (STREAM_ENCODE_STRIPS > 3 ? 3 : STREAM_ENCODE_STRIPS);
@@ -246,7 +268,7 @@ namespace {
 
         sLinearSurface.image = MEMAllocFromMappedMemoryForGX2Ex(sLinearSurface.imageSize, sLinearSurface.alignment);
         if (sLinearSurface.image == nullptr) {
-            DEBUG_FUNCTION_LINE_ERR("Stream: failed to alloc %u bytes for linear surface", sLinearSurface.imageSize);
+            STREAM_LOG_ERR("Stream: failed to alloc %u bytes for linear surface", sLinearSurface.imageSize);
             sLinearValid = false;
             return false;
         }
@@ -384,7 +406,7 @@ namespace {
             sStatSendUs.fetch_add(static_cast<uint32_t>(OSTicksToMicroseconds(OSGetSystemTime() - t0)));
             sStatSent.fetch_add(1);
             if (!ok) {
-                DEBUG_FUNCTION_LINE_INFO("Stream: viewer disconnected (send)");
+                STREAM_LOG_INFO("Stream: viewer disconnected (send)");
                 sStreaming.store(false);
                 sCond.notify_all();
                 break;
@@ -474,7 +496,7 @@ namespace {
                 }
             }
             if (!allOk) {
-                DEBUG_FUNCTION_LINE_WARN("Stream: a strip JPEG encode failed");
+                STREAM_LOG_WARN("Stream: a strip JPEG encode failed");
                 continue;
             }
 
@@ -539,7 +561,7 @@ namespace {
                     sQuality.store(q);
                 }
 
-                DEBUG_FUNCTION_LINE_INFO(
+                STREAM_LOG_INFO(
                     "Stream stats: %ux%u x%d strips | enc %u fps, sent %u fps, drop %u | q=%u %s(%u-%u) | unpack+encode %llu us | gpuwait %llu us | send %u us | %llu KB/frame | gx2enq %u us x%u/s",
                     statW, statH, kNumStrips, statEnc, sent, statDropped,
                     sQuality.load(), sAuto.load() ? "auto " : "PIN ", qMin, qMax,
@@ -578,6 +600,9 @@ namespace {
                 sSendCond.notify_all();
                 break;
             }
+            const uint32_t prevMode = sMode.load();
+            const bool prevAuto     = sAuto.load();
+            const uint32_t prevQ    = sQuality.load();
             switch (b) {
                 case CTRL_MODE_PERFORMANCE: applyMode(0); break;
                 case CTRL_MODE_BALANCED:    applyMode(1); break;
@@ -588,9 +613,14 @@ namespace {
                 case CTRL_QUALITY_DOWN:     nudgeQuality(-5); break;
                 default: continue;
             }
-            DEBUG_FUNCTION_LINE_INFO("Stream: control 0x%02X -> mode %u, %s, q=%u",
-                                     b, sMode.load(), sAuto.load() ? "auto" : "pin",
-                                     sQuality.load());
+            // Only log on an actual state change, so holding/spamming a key (e.g.
+            // quality already at the cap) can't flood the logger.
+            if (sMode.load() != prevMode || sAuto.load() != prevAuto ||
+                sQuality.load() != prevQ) {
+                STREAM_LOG_INFO("Stream: control 0x%02X -> mode %u, %s, q=%u",
+                                b, sMode.load(), sAuto.load() ? "auto" : "pin",
+                                sQuality.load());
+            }
         }
     }
 
@@ -746,7 +776,7 @@ void CaptureTVFrameIfRequested(GX2ColorBuffer *colorBuffer) {
         static bool warned = false;
         if (!warned) {
             warned = true;
-            DEBUG_FUNCTION_LINE_WARN("Stream: unsupported TV format 0x%X; not streaming", format);
+            STREAM_LOG_WARN("Stream: unsupported TV format 0x%X; not streaming", format);
         }
         return;
     }

@@ -31,20 +31,11 @@ void UpdateAudioMode();
 
 DECL_FUNCTION(void, GX2CopyColorBufferToScanBuffer, GX2ColorBuffer *colorBuffer, GX2ScanTarget scan_target) {
     if (scan_target == GX2_SCAN_TARGET_TV) {
-        // Phase 1 capture probe: confirm we're seeing valid TV-frame surface data
-        // at the point the game hands it off, before it would reach the (dead) HDMI port.
-        if (gEnabled) {
-            static uint32_t sTvFrameLogCounter = 0;
-            if ((sTvFrameLogCounter++ % 120) == 0) {
-                const auto &surface = colorBuffer->surface;
-                DEBUG_FUNCTION_LINE_INFO("TV frame: %ux%u fmt=0x%X image=%p pitch=%u tileMode=%u imageSize=%u",
-                                          surface.width, surface.height, surface.format,
-                                          surface.image, surface.pitch, surface.tileMode, surface.imageSize);
-            }
-        }
-
-        // Phase 2: if a PC viewer is connected and waiting, grab this TV frame.
-        // No-op (single atomic load) when nothing is connected.
+        // If a PC viewer is connected and waiting, grab this TV frame. No-op
+        // (single atomic load) when nothing is connected. NOTE: deliberately do
+        // NOT log from this hook - it runs on the game's render thread, and
+        // WHBLogUdp is not thread-safe; logging here concurrently with the
+        // encoder/control threads can corrupt the logger and hang the game.
         CaptureTVFrameIfRequested(colorBuffer);
     }
 
