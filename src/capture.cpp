@@ -16,6 +16,10 @@
  * Frames are dropped at every handoff if the next stage is busy, so nothing
  * ever backs up (live, low-latency).
  *
+ * Protocol v2 handshake (console -> PC, once per connection, before any frame):
+ *   [4 bytes] magic "SSMS"
+ *   [1 byte ] STREAM_PROTOCOL_VERSION
+ *
  * Multi-strip wire protocol (console -> PC), repeated per frame:
  *   [4 bytes BE] outerLen (number of bytes that follow)
  *   [2 bytes BE] full frame width W
@@ -24,8 +28,16 @@
  *   then N times:
  *     [2 bytes BE] strip Y offset (row in the full frame)
  *     [2 bytes BE] strip height
- *     [4 bytes BE] jpeg length
- *     [jpeg bytes] a complete baseline JPEG (W x stripHeight)
+ *     [1 byte    ] strip type (STRIP_TYPE_UNCHANGED | STRIP_TYPE_JPEG)
+ *     if STRIP_TYPE_JPEG:
+ *       [4 bytes BE] jpeg length
+ *       [jpeg bytes] a complete baseline JPEG (W x stripHeight)
+ *
+ * Dirty-strip skipping: each strip's source pixels are FNV-1a hashed; a strip
+ * whose hash matches the previous frame is sent as STRIP_TYPE_UNCHANGED (no
+ * JPEG, no encode work). The first frame of every connection and the first
+ * frame after any resolution change are forced full (all strips JPEG) so the
+ * viewer always has a complete baseline.
  *
  * The console LISTENS on CAPTURE_TCP_PORT (INADDR_ANY, no hardcoded IP); a PC
  * viewer connects in. Capture only happens while a viewer is connected.
@@ -71,26 +83,26 @@ namespace {
     // corrupt the logger (which previously hung the console). __LINE__/__FUNCTION__
     // still resolve to the call site since these are macros.
     std::mutex sLogMutex;
-#define STREAM_LOG_INFO(...)                              \
-    do {                                                  \
-        std::lock_guard<std::mutex> _llk(sLogMutex);      \
-        DEBUG_FUNCTION_LINE_INFO(__VA_ARGS__);            \
+#define STREAM_LOG_INFO(...)                         \
+    do {                                             \
+        std::lock_guard<std::mutex> _llk(sLogMutex); \
+        DEBUG_FUNCTION_LINE_INFO(__VA_ARGS__);       \
     } while (0)
-#define STREAM_LOG_WARN(...)                              \
-    do {                                                  \
-        std::lock_guard<std::mutex> _llk(sLogMutex);      \
-        DEBUG_FUNCTION_LINE_WARN(__VA_ARGS__);            \
+#define STREAM_LOG_WARN(...)                         \
+    do {                                             \
+        std::lock_guard<std::mutex> _llk(sLogMutex); \
+        DEBUG_FUNCTION_LINE_WARN(__VA_ARGS__);       \
     } while (0)
-#define STREAM_LOG_ERR(...)                               \
-    do {                                                  \
-        std::lock_guard<std::mutex> _llk(sLogMutex);      \
-        DEBUG_FUNCTION_LINE_ERR(__VA_ARGS__);             \
+#define STREAM_LOG_ERR(...)                          \
+    do {                                             \
+        std::lock_guard<std::mutex> _llk(sLogMutex); \
+        DEBUG_FUNCTION_LINE_ERR(__VA_ARGS__);        \
     } while (0)
 
 
     // Clamp the configured strip count to [1, 3] (the Espresso has 3 cores).
     constexpr int kNumStrips = STREAM_ENCODE_STRIPS < 1 ? 1
-                               : (STREAM_ENCODE_STRIPS > 3 ? 3 : STREAM_ENCODE_STRIPS);
+                                                        : (STREAM_ENCODE_STRIPS > 3 ? 3 : STREAM_ENCODE_STRIPS);
     // Core assignment, most-isolated-from-the-game first: cores 0 and 2 leave
     // core 1 (the main game core) freest; a 3rd strip then takes core 1.
     constexpr int kStripCore[3] = {0, 2, 1};
@@ -104,9 +116,9 @@ namespace {
         uint32_t qMax;      // adaptive quality ceiling for this band
     };
     constexpr Band kBands[3] = {
-        {3, 25, 50}, // 0 Performance: 426x240
-        {2, 30, 60}, // 1 Balanced:    640x360
-        {2, 55, 80}, // 2 Quality:     640x360
+            {3, 25, 50}, // 0 Performance: 426x240
+            {2, 30, 60}, // 1 Balanced:    640x360
+            {2, 55, 80}, // 2 Quality:     640x360
     };
     constexpr uint32_t kQualityHardMin = 15;
     constexpr uint32_t kQualityHardMax = 90;
@@ -138,10 +150,10 @@ namespace {
     bool sLinearValid = false;
 
     // Captured frame metadata (written by hook under sMutex, read by encoder).
-    uint32_t sMetaWidth  = 0;
-    uint32_t sMetaHeight = 0;
-    uint32_t sMetaPitch  = 0;
-    uint32_t sMetaFormat = 0;
+    uint32_t sMetaWidth      = 0;
+    uint32_t sMetaHeight     = 0;
+    uint32_t sMetaPitch      = 0;
+    uint32_t sMetaFormat     = 0;
     OSTime sCaptureTimeStamp = 0; // GPU timestamp the de-tile copy completes at
 
     // Strip workers run BELOW the game's threads (which sit around prio 16) so the
@@ -170,21 +182,27 @@ namespace {
     void jpegWrite2(unsigned char b) { sJpegSink[2]->push_back(b); }
     TooJpeg::WRITE_ONE_BYTE jpegSinkFn(int idx) {
         switch (idx) {
-            case 0:  return jpegWrite0;
-            case 1:  return jpegWrite1;
-            default: return jpegWrite2;
+            case 0:
+                return jpegWrite0;
+            case 1:
+                return jpegWrite1;
+            default:
+                return jpegWrite2;
         }
     }
 
     // --- Strip worker pool (fork/join, persistent, core-pinned) ---
     struct StripWorker {
         std::thread thread;
-        int idx = 0;
-        uint32_t y = 0;             // first row of this strip in the downscaled frame
-        uint32_t h = 0;             // number of rows in this strip
-        std::vector<uint8_t> rgb;   // unpacked RGB888 for this strip
-        std::vector<uint8_t> jpeg;  // encoded JPEG for this strip
-        bool ok = false;
+        int idx    = 0;
+        uint32_t y = 0;            // first row of this strip in the downscaled frame
+        uint32_t h = 0;            // number of rows in this strip
+        std::vector<uint8_t> rgb;  // unpacked RGB888 for this strip
+        std::vector<uint8_t> jpeg; // encoded JPEG for this strip
+        bool ok           = false;
+        uint64_t hash     = 0;     // FNV-1a of this frame's source pixels
+        uint64_t lastHash = 0;     // hash of the last JPEG-encoded frame (for skip)
+        bool unchanged    = false; // this strip matched lastHash -> send UNCHANGED
     };
     StripWorker sWorkers[3];
 
@@ -202,6 +220,16 @@ namespace {
     uint32_t sStripPitchBytes = 0;
     uint32_t sStripQuality    = 40; // JPEG quality for this frame (all strips equal)
     const uint8_t *sStripBase = nullptr;
+    bool sStripForceKey       = false; // this frame: encode every strip (ignore hash)
+
+    // Set true so the next captured frame is a full keyframe (all strips JPEG):
+    // on each new viewer connection and on any resolution change. Read+cleared by
+    // the encoder thread.
+    std::atomic<bool> sForceKeyframe{true};
+    // Encoder-thread-only: the encoded dimensions of the previous frame, to detect
+    // a resolution change (which invalidates every strip's stored hash).
+    uint32_t sLastOutW = 0;
+    uint32_t sLastOutH = 0;
 
     // Apply a mode (band): set resolution + clamp current quality into the band.
     void applyMode(uint32_t mode) {
@@ -228,7 +256,7 @@ namespace {
     }
 
     bool sendAll(int fd, const void *buf, size_t len) {
-        auto *p = static_cast<const uint8_t *>(buf);
+        auto *p     = static_cast<const uint8_t *>(buf);
         size_t sent = 0;
         while (sent < len) {
             const ssize_t n = send(fd, p + sent, len - sent, 0);
@@ -274,6 +302,35 @@ namespace {
         }
         sLinearValid = true;
         return true;
+    }
+
+    // FNV-1a hash of the source pixels this strip samples (the same strided set
+    // of 32-bit pixels unpackStrip would read). Hashing the SOURCE lets us detect
+    // an unchanged strip and skip both the unpack and the (expensive) JPEG encode.
+    // One FNV step per pixel (4 bytes folded into a u32), so it is far cheaper
+    // than the encode it can save. 64-bit math is fine here (it is plain data, not
+    // a std::atomic, which the 32-bit Espresso cannot do at 64 bits).
+    uint64_t hashStrip(const StripWorker &w) {
+        const uint32_t scale      = sStripScale;
+        const uint32_t outW       = sStripOutW;
+        const uint32_t pitchBytes = sStripPitchBytes;
+        const uint32_t stepBytes  = scale * 4;
+        const uint8_t *base       = sStripBase;
+
+        uint64_t hash = 1469598103934665603ull; // FNV-1a offset basis
+        for (uint32_t row = 0; row < w.h; row++) {
+            const uint8_t *px = base + static_cast<size_t>((w.y + row) * scale) * pitchBytes;
+            for (uint32_t ox = 0; ox < outW; ox++) {
+                const uint32_t p = static_cast<uint32_t>(px[0]) |
+                                   (static_cast<uint32_t>(px[1]) << 8) |
+                                   (static_cast<uint32_t>(px[2]) << 16) |
+                                   (static_cast<uint32_t>(px[3]) << 24);
+                hash ^= p;
+                hash *= 1099511628211ull; // FNV prime
+                px += stepBytes;
+            }
+        }
+        return hash;
     }
 
     // Unpack + downscale one worker's horizontal strip into its RGB888 buffer.
@@ -338,12 +395,26 @@ namespace {
             }
 
             StripWorker &w = sWorkers[idx];
-            unpackStrip(w);
-            w.jpeg.clear();
-            w.ok = TooJpeg::writeJpeg(jpegSinkFn(idx), w.rgb.data(),
-                                      static_cast<unsigned short>(sStripOutW),
-                                      static_cast<unsigned short>(w.h),
-                                      true, static_cast<unsigned char>(sStripQuality), STREAM_JPEG_420);
+            w.hash         = hashStrip(w);
+            if (!sStripForceKey && w.hash == w.lastHash) {
+                // Source pixels are identical to the last frame we sent for this
+                // strip: emit UNCHANGED, skipping unpack + encode entirely.
+                w.unchanged = true;
+                w.ok        = true;
+            } else {
+                w.unchanged = false;
+                unpackStrip(w);
+                w.jpeg.clear();
+                w.ok = TooJpeg::writeJpeg(jpegSinkFn(idx), w.rgb.data(),
+                                          static_cast<unsigned short>(sStripOutW),
+                                          static_cast<unsigned short>(w.h),
+                                          true, static_cast<unsigned char>(sStripQuality), STREAM_JPEG_420);
+                // Only commit the hash once the strip actually encoded, so a failed
+                // encode is retried (not skipped) on the next frame.
+                if (w.ok) {
+                    w.lastHash = w.hash;
+                }
+            }
 
             {
                 std::lock_guard<std::mutex> lk(sWorkMutex);
@@ -402,7 +473,7 @@ namespace {
             }
 
             const OSTime t0 = OSGetSystemTime();
-            const bool ok = sendAll(clientFd, local.data(), local.size());
+            const bool ok   = sendAll(clientFd, local.data(), local.size());
             sStatSendUs.fetch_add(static_cast<uint32_t>(OSTicksToMicroseconds(OSGetSystemTime() - t0)));
             sStatSent.fetch_add(1);
             if (!ok) {
@@ -418,11 +489,13 @@ namespace {
     // connected): waits for a de-tiled frame, forks the strip workers, joins
     // them, assembles the multi-strip payload, and hands it to the sender.
     void encoderLoop() {
-        OSTime windowStart = OSGetSystemTime();
-        uint32_t statEnc = 0;
+        OSTime windowStart      = OSGetSystemTime();
+        uint32_t statEnc        = 0;
         uint64_t statParallelUs = 0, statBytes = 0, statWaitUs = 0;
         uint32_t statW = 0, statH = 0;
         uint32_t statDropped = 0; // frames overwritten unsent (network behind)
+        uint32_t statSkipped = 0; // UNCHANGED strips this window (dirty-skip wins)
+        uint32_t statStrips  = 0; // total strips this window (= statEnc * kNumStrips)
 
         while (sServerRunning && sStreaming) {
             {
@@ -454,6 +527,16 @@ namespace {
             const uint32_t outW = sMetaWidth / scale;
             const uint32_t outH = sMetaHeight / scale;
 
+            // Decide whether this frame must be a full keyframe (every strip JPEG):
+            // the first frame of a connection (sForceKeyframe) or any resolution
+            // change, which moves every strip boundary and invalidates the hashes.
+            bool forceKey = sForceKeyframe.exchange(false);
+            if (outW != sLastOutW || outH != sLastOutH) {
+                forceKey = true;
+            }
+            sLastOutW = outW;
+            sLastOutH = outH;
+
             // Dispatch: set the per-strip params, then bump the generation.
             {
                 std::lock_guard<std::mutex> lk(sWorkMutex);
@@ -463,9 +546,10 @@ namespace {
                 sStripPitchBytes = sMetaPitch * 4;
                 sStripQuality    = sQuality.load();
                 sStripBase       = static_cast<const uint8_t *>(sLinearSurface.image);
+                sStripForceKey   = forceKey;
 
                 const uint32_t stripRows = outH / kNumStrips;
-                uint32_t y = 0;
+                uint32_t y               = 0;
                 for (int i = 0; i < kNumStrips; i++) {
                     sWorkers[i].y = y;
                     sWorkers[i].h = (i == kNumStrips - 1) ? (outH - y) : stripRows;
@@ -487,16 +571,21 @@ namespace {
 
             const OSTime tWork1 = OSGetSystemTime();
 
-            // Assemble the multi-strip payload (reserve 4 bytes for outerLen).
+            // Assemble the multi-strip payload (reserve 4 bytes for outerLen). A
+            // strip is fine if it was skipped (UNCHANGED) or it encoded a non-empty
+            // JPEG; a changed strip with a failed/empty encode aborts the frame.
             bool allOk = true;
             for (int i = 0; i < kNumStrips; i++) {
-                if (!sWorkers[i].ok || sWorkers[i].jpeg.empty()) {
+                if (!sWorkers[i].unchanged && (!sWorkers[i].ok || sWorkers[i].jpeg.empty())) {
                     allOk = false;
                     break;
                 }
             }
             if (!allOk) {
                 STREAM_LOG_WARN("Stream: a strip JPEG encode failed");
+                // Some strips may have committed their hash this frame; force the
+                // next frame full so no strip is skipped without a fresh baseline.
+                sForceKeyframe.store(true);
                 continue;
             }
 
@@ -505,14 +594,21 @@ namespace {
             putBE16(sPayload, outW);
             putBE16(sPayload, outH);
             sPayload.push_back(static_cast<uint8_t>(kNumStrips));
-            uint32_t frameBytes = 0;
+            uint32_t frameBytes   = 0;
+            uint32_t frameSkipped = 0;
             for (int i = 0; i < kNumStrips; i++) {
                 const StripWorker &w = sWorkers[i];
                 putBE16(sPayload, w.y);
                 putBE16(sPayload, w.h);
-                putBE32(sPayload, static_cast<uint32_t>(w.jpeg.size()));
-                sPayload.insert(sPayload.end(), w.jpeg.begin(), w.jpeg.end());
-                frameBytes += static_cast<uint32_t>(w.jpeg.size());
+                if (w.unchanged) {
+                    sPayload.push_back(STRIP_TYPE_UNCHANGED);
+                    frameSkipped++;
+                } else {
+                    sPayload.push_back(STRIP_TYPE_JPEG);
+                    putBE32(sPayload, static_cast<uint32_t>(w.jpeg.size()));
+                    sPayload.insert(sPayload.end(), w.jpeg.begin(), w.jpeg.end());
+                    frameBytes += static_cast<uint32_t>(w.jpeg.size());
+                }
             }
             const uint32_t outerLen = static_cast<uint32_t>(sPayload.size() - 4);
             const uint32_t lenBE    = htonl(outerLen);
@@ -533,7 +629,9 @@ namespace {
 
             statEnc++;
             statParallelUs += OSTicksToMicroseconds(tWork1 - tWork0);
-            statBytes      += frameBytes;
+            statBytes += frameBytes;
+            statSkipped += frameSkipped;
+            statStrips += static_cast<uint32_t>(kNumStrips);
             statW = outW;
             statH = outH;
 
@@ -562,18 +660,20 @@ namespace {
                 }
 
                 STREAM_LOG_INFO(
-                    "Stream stats: %ux%u x%d strips | enc %u fps, sent %u fps, drop %u | q=%u %s(%u-%u) | unpack+encode %llu us | gpuwait %llu us | send %u us | %llu KB/frame | gx2enq %u us x%u/s",
-                    statW, statH, kNumStrips, statEnc, sent, statDropped,
-                    sQuality.load(), sAuto.load() ? "auto " : "PIN ", qMin, qMax,
-                    statParallelUs / statEnc,
-                    statWaitUs / statEnc,
-                    sent ? sendUs / sent : 0,
-                    (statBytes / statEnc) / 1024,
-                    captured ? gx2Us / captured : 0, captured);
-                windowStart = tWork1;
-                statEnc = 0;
+                        "Stream stats: %ux%u x%d strips | enc %u fps, sent %u fps, drop %u | skip %u/%u (%u%%) | q=%u %s(%u-%u) | unpack+encode %llu us | gpuwait %llu us | send %u us | %llu KB/frame | gx2enq %u us x%u/s",
+                        statW, statH, kNumStrips, statEnc, sent, statDropped,
+                        statSkipped, statStrips, statStrips ? statSkipped * 100 / statStrips : 0,
+                        sQuality.load(), sAuto.load() ? "auto " : "PIN ", qMin, qMax,
+                        statParallelUs / statEnc,
+                        statWaitUs / statEnc,
+                        sent ? sendUs / sent : 0,
+                        (statBytes / statEnc) / 1024,
+                        captured ? gx2Us / captured : 0, captured);
+                windowStart    = tWork1;
+                statEnc        = 0;
                 statParallelUs = statBytes = statWaitUs = 0;
-                statDropped = 0;
+                statDropped                             = 0;
+                statSkipped = statStrips = 0;
             }
         }
     }
@@ -604,14 +704,29 @@ namespace {
             const bool prevAuto     = sAuto.load();
             const uint32_t prevQ    = sQuality.load();
             switch (b) {
-                case CTRL_MODE_PERFORMANCE: applyMode(0); break;
-                case CTRL_MODE_BALANCED:    applyMode(1); break;
-                case CTRL_MODE_QUALITY:     applyMode(2); break;
-                case CTRL_AUTO_ON:          sAuto.store(true); break;
-                case CTRL_AUTO_OFF:         sAuto.store(false); break;
-                case CTRL_QUALITY_UP:       nudgeQuality(+5); break;
-                case CTRL_QUALITY_DOWN:     nudgeQuality(-5); break;
-                default: continue;
+                case CTRL_MODE_PERFORMANCE:
+                    applyMode(0);
+                    break;
+                case CTRL_MODE_BALANCED:
+                    applyMode(1);
+                    break;
+                case CTRL_MODE_QUALITY:
+                    applyMode(2);
+                    break;
+                case CTRL_AUTO_ON:
+                    sAuto.store(true);
+                    break;
+                case CTRL_AUTO_OFF:
+                    sAuto.store(false);
+                    break;
+                case CTRL_QUALITY_UP:
+                    nudgeQuality(+5);
+                    break;
+                case CTRL_QUALITY_DOWN:
+                    nudgeQuality(-5);
+                    break;
+                default:
+                    continue;
             }
             // Only log on an actual state change, so holding/spamming a key (e.g.
             // quality already at the cap) can't flood the logger.
@@ -657,7 +772,7 @@ namespace {
         if (bind(listenFd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) < 0) {
             DEBUG_FUNCTION_LINE_ERR("Stream: bind() failed on port %d", CAPTURE_TCP_PORT);
             close(listenFd);
-            sListenFd = -1;
+            sListenFd      = -1;
             sServerRunning = false;
             return;
         }
@@ -687,8 +802,22 @@ namespace {
             int sndbuf = 64 * 1024;
             setsockopt(clientFd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
+            // Protocol handshake: "SSMS" + version, so the viewer can refuse an
+            // incompatible console rather than misparse the first frame's bytes.
+            const uint8_t handshake[5] = {'S', 'S', 'M', 'S', STREAM_PROTOCOL_VERSION};
+            if (!sendAll(clientFd, handshake, sizeof(handshake))) {
+                STREAM_LOG_WARN("Stream: handshake send failed; dropping viewer");
+                close(clientFd);
+                continue;
+            }
+
             sFrameCounter = 0;
             sRawPending.store(false);
+            // First frame for this viewer must be a full keyframe (all strips JPEG)
+            // so they start from a complete baseline; also reset the res tracker.
+            sForceKeyframe.store(true);
+            sLastOutW = 0;
+            sLastOutH = 0;
             {
                 std::lock_guard<std::mutex> lk(sSendMutex);
                 sSendPending = false;
@@ -730,8 +859,8 @@ void StartCaptureServer() {
     if (sServerRunning.exchange(true)) {
         return; // already running
     }
-    sStreaming  = false;
-    sRawPending = false;
+    sStreaming    = false;
+    sRawPending   = false;
     sServerThread = std::thread(serverThread);
 }
 
