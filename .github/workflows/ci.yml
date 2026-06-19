@@ -38,6 +38,10 @@ jobs:
   deploy-binary:
     needs: build-binary
     runs-on: ubuntu-22.04
+    # Needed for softprops/action-gh-release to create the release + generate
+    # notes; the default GITHUB_TOKEN is read-only on this repo.
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@master
         with:
