@@ -14,6 +14,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  ****************************************************************************/
+#include "capture.h"
 #include "main.h"
 #include "retain_vars.hpp"
 #include "utils/config.h"
@@ -25,7 +26,7 @@
 #include <wups/button_combo/api.h>
 
 // Mandatory plugin information.
-WUPS_PLUGIN_NAME("SwipSwapMe");
+WUPS_PLUGIN_NAME("SwipSwapMeStream");
 WUPS_PLUGIN_DESCRIPTION("Swaps the GamePad and TV screen when pressing a certain button combination");
 WUPS_PLUGIN_VERSION(PLUGIN_VERSION_FULL);
 WUPS_PLUGIN_AUTHOR("Maschell");
@@ -34,7 +35,7 @@ WUPS_PLUGIN_LICENSE("GPL");
 // FS Access
 WUPS_USE_WUT_DEVOPTAB();
 
-WUPS_USE_STORAGE("SwipSwapMeAroma");
+WUPS_USE_STORAGE("SwipSwapMeStreamAroma");
 
 
 namespace {
@@ -234,7 +235,7 @@ void showNotificationOnFirstBoot() {
 std::forward_list<WUPSButtonComboAPI::ButtonCombo> sButtonCombos;
 
 WUPSButtonCombo_ComboHandle RegisterButtonCombo(const std::string_view label, const WUPSButtonCombo_Buttons buttonCombo, const WUPSButtonCombo_ComboCallback callback) {
-    const auto buttonComboLabel        = string_format("SwipSwapMe: %s", label.data());
+    const auto buttonComboLabel        = string_format("SwipSwapMeStream: %s", label.data());
     WUPSButtonCombo_ComboStatus status = WUPS_BUTTON_COMBO_COMBO_STATUS_INVALID_STATUS;
     WUPSButtonCombo_Error err          = WUPS_BUTTON_COMBO_ERROR_UNKNOWN_ERROR;
     auto res                           = WUPSButtonComboAPI::CreateComboPressDown(buttonComboLabel,
@@ -244,16 +245,16 @@ WUPSButtonCombo_ComboHandle RegisterButtonCombo(const std::string_view label, co
                                                                                   status,
                                                                                   err);
     if (!res || err != WUPS_BUTTON_COMBO_ERROR_SUCCESS) {
-        const std::string errorMsg = string_format("SwipSwapMe: Failed to register button combo \"%s\"", label.data());
+        const std::string errorMsg = string_format("SwipSwapMeStream: Failed to register button combo \"%s\"", label.data());
         DEBUG_FUNCTION_LINE_ERR("%s", errorMsg.c_str());
         NotificationModule_AddErrorNotification(errorMsg.c_str());
     } else {
         if (status == WUPS_BUTTON_COMBO_COMBO_STATUS_CONFLICT) {
-            const auto conflictMsg = string_format("SwipSwapMe: \"%s\"-combo was disabled due to a conflict. Please assign a different combo", label.data());
+            const auto conflictMsg = string_format("SwipSwapMeStream: \"%s\"-combo was disabled due to a conflict. Please assign a different combo", label.data());
             DEBUG_FUNCTION_LINE_INFO("%s", conflictMsg.c_str());
             NotificationModule_AddInfoNotification(conflictMsg.c_str());
         } else if (status != WUPS_BUTTON_COMBO_COMBO_STATUS_VALID) {
-            const auto conflictMsg = string_format("SwipSwapMe: Unknown error happened while registering button combo \"%s\"", label.data());
+            const auto conflictMsg = string_format("SwipSwapMeStream: Unknown error happened while registering button combo \"%s\"", label.data());
             DEBUG_FUNCTION_LINE_INFO("%s", conflictMsg.c_str());
             NotificationModule_AddInfoNotification(conflictMsg.c_str());
         }
@@ -367,9 +368,13 @@ ON_APPLICATION_START() {
 
     sAudioModeAtStart  = gCurAudioMode;
     sScreenModeAtStart = gCurScreenMode;
+
+    StartCaptureServer();
 }
 
 ON_APPLICATION_REQUESTS_EXIT() {
+    StopCaptureServer();
+
     if (sAudioModeAtStart != gCurAudioMode || sScreenModeAtStart != gCurScreenMode) {
         WUPSStorageError err;
         if ((err = WUPSStorageAPI::Store(AUDIO_MODE_CONFIG_STRING, gCurAudioMode)) != WUPS_STORAGE_ERROR_SUCCESS) {

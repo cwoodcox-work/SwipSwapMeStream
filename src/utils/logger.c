@@ -13,8 +13,12 @@ void initLogging() {
 #ifdef DEBUG
     if (!(moduleLogInit = WHBLogModuleInit())) {
         cafeLogInit = WHBLogCafeInit();
-        udpLogInit  = WHBLogUdpInit();
     }
+    // Always bring up UDP logging too (broadcasts to port 4405) so logs are
+    // visible on the PC regardless of whether LoggingModule is installed.
+    // HDMI is dead and the GamePad screen is cracked, so PC-side log capture
+    // is our primary debugging channel.
+    udpLogInit = WHBLogUdpInit();
 #endif // DEBUG
 }
 

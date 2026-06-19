@@ -1,4 +1,6 @@
-# SwipSwapMe Plugin
+# SwipSwapMeStream Plugin
+
+Fork of SwipSwapMe used as the base for TV-frame-capture + LAN streaming.
 
 This little plugin can be used to swap the TV and GamePad screen and offers different audio modes.
 

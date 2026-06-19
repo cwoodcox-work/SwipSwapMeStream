@@ -20,9 +20,9 @@ WUMS_ROOT := $(DEVKITPRO)/wums
 # DATA is a list of directories containing data files
 # INCLUDES is a list of directories containing header files
 #-------------------------------------------------------------------------------
-TARGET		:=	swipswapme
+TARGET		:=	swipswapmestream
 BUILD		:=	build
-SOURCES		:=	src src/utils
+SOURCES		:=	src src/utils src/thirdparty
 DATA		:=	data
 INCLUDES	:=	src
 
