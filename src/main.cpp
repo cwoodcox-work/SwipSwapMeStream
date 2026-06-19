@@ -14,8 +14,8 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  ****************************************************************************/
-#include "capture.h"
 #include "main.h"
+#include "capture.h"
 #include "retain_vars.hpp"
 #include "utils/config.h"
 #include "utils/logger.h"
