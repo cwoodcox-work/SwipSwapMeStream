@@ -49,6 +49,15 @@ CXXFLAGS += -DDEBUG -DVERBOSE_DEBUG -g
 CFLAGS += -DDEBUG -DVERBOSE_DEBUG -g
 endif
 
+# One-shot encoder profiler (perf "Lever #2" step 0). Build with PROFILE_ENCODE=1
+# (alongside DEBUG=1 for the UDP log) to make toojpeg split each encode into
+# color-convert / DCT+quant / entropy phases; the first strip after a viewer
+# connects logs the breakdown. Off by default so normal builds are unaffected.
+ifeq ($(PROFILE_ENCODE),1)
+CXXFLAGS += -DTOOJPEG_PROFILE
+CFLAGS += -DTOOJPEG_PROFILE
+endif
+
 LIBS	:= -lwups -lnotifications -lmappedmemory -lwut
 
 #-------------------------------------------------------------------------------

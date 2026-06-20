@@ -6,6 +6,19 @@
 
 #include "toojpeg.h"
 
+// One-shot encode profiler (see toojpeg.h EncodeProfile). Entirely compiled out
+// unless built with -DTOOJPEG_PROFILE, so the normal encoder stays include-free
+// and byte-identical. When enabled, phases accumulate Wii U CPU timebase ticks
+// into the caller's EncodeProfile via OSGetSystemTime().
+#ifdef TOOJPEG_PROFILE
+  #include <coreinit/time.h>
+  #define PROF_START(var)        const long long var = OSGetSystemTime()
+  #define PROF_ADD(field, start) do { if (prof) (prof)->field += (unsigned long long)(OSGetSystemTime() - (start)); } while (0)
+#else
+  #define PROF_START(var)        ((void)0)
+  #define PROF_ADD(field, start) ((void)0)
+#endif
+
 // - the "official" specifications: https://www.w3.org/Graphics/JPEG/itu-t81.pdf and https://www.w3.org/Graphics/JPEG/jfif3.pdf
 // - Wikipedia has a short description of the JFIF/JPEG file format: https://en.wikipedia.org/wiki/JPEG_File_Interchange_Format
 // - the popular STB Image library includes Jon's JPEG encoder as well: https://github.com/nothings/stb/blob/master/stb_image_write.h
@@ -250,11 +263,15 @@ void DCT(float block[8*8], uint8_t stride) // stride must be 1 (=horizontal) or 
 
 // run DCT, quantize and write Huffman bit codes
 int16_t encodeBlock(BitWriter& writer, float block[8][8], const float scaled[8*8], int16_t lastDC,
-                    const BitCode huffmanDC[256], const BitCode huffmanAC[256], const BitCode* codewords)
+                    const BitCode huffmanDC[256], const BitCode huffmanAC[256], const BitCode* codewords,
+                    TooJpeg::EncodeProfile* prof = nullptr)
 {
+  (void)prof; // unused unless built with -DTOOJPEG_PROFILE
+
   // "linearize" the 8x8 block, treat it as a flat array of 64 floats
   auto block64 = (float*) block;
 
+  PROF_START(tDct);
   // DCT: rows
   for (auto offset = 0; offset < 8; offset++)
     DCT(block64 + offset*8, 1);
@@ -281,6 +298,9 @@ int16_t encodeBlock(BitWriter& writer, float block[8][8], const float scaled[8*8
     if (quantized[i] != 0)
       posNonZero = i;
   }
+
+  PROF_ADD(dctQuantTicks, tDct);
+  PROF_START(tEnt);
 
   // same "average color" as previous block ?
   auto diff = DC - lastDC;
@@ -319,6 +339,8 @@ int16_t encodeBlock(BitWriter& writer, float block[8][8], const float scaled[8*8
   if (posNonZero < 8*8 - 1) // = 63
     writer << huffmanAC[0x00];
 
+  PROF_ADD(entropyTicks, tEnt);
+
   return DC;
 }
 
@@ -347,8 +369,10 @@ namespace TooJpeg
 {
 // the only exported function ...
 bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width, unsigned short height,
-               bool isRGB, unsigned char quality_, bool downsample, const char* comment)
+               bool isRGB, unsigned char quality_, bool downsample, const char* comment, EncodeProfile* prof)
 {
+  (void)prof; // unused unless built with -DTOOJPEG_PROFILE
+
   // reject invalid pointers
   if (output == nullptr || pixels_ == nullptr)
     return false;
@@ -565,6 +589,7 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
         for (auto blockX = 0; blockX < mcuSize; blockX += 8)
         {
           // now we finally have an 8x8 block ...
+          PROF_START(tCol);
           for (auto deltaY = 0; deltaY < 8; deltaY++)
           {
             auto column = minimum(mcuX + blockX         , maxWidth); // must not exceed image borders, replicate last row/column if needed
@@ -597,9 +622,10 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
               }
             }
           }
+          PROF_ADD(colorTicks, tCol);
 
         // encode Y channel
-        lastYDC = encodeBlock(bitWriter, Y, scaledLuminance, lastYDC, huffmanLuminanceDC, huffmanLuminanceAC, codewords);
+        lastYDC = encodeBlock(bitWriter, Y, scaledLuminance, lastYDC, huffmanLuminanceDC, huffmanLuminanceAC, codewords, prof);
         // Cb and Cr are encoded about 50 lines below
       }
 
@@ -610,6 +636,7 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
       // ////////////////////////////////////////
       // the following lines are only relevant for YCbCr420:
       // average/downsample chrominance of four pixels while respecting the image borders
+      PROF_START(tChroma);
       if (downsample)
         for (short deltaY = 7; downsample && deltaY >= 0; deltaY--) // iterating loop in reverse increases cache read efficiency
         {
@@ -649,10 +676,11 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
             }
           }
         } // end of YCbCr420 code for Cb and Cr
+      PROF_ADD(colorTicks, tChroma);
 
       // encode Cb and Cr
-      lastCbDC = encodeBlock(bitWriter, Cb, scaledChrominance, lastCbDC, huffmanChrominanceDC, huffmanChrominanceAC, codewords);
-      lastCrDC = encodeBlock(bitWriter, Cr, scaledChrominance, lastCrDC, huffmanChrominanceDC, huffmanChrominanceAC, codewords);
+      lastCbDC = encodeBlock(bitWriter, Cb, scaledChrominance, lastCbDC, huffmanChrominanceDC, huffmanChrominanceAC, codewords, prof);
+      lastCrDC = encodeBlock(bitWriter, Cr, scaledChrominance, lastCrDC, huffmanChrominanceDC, huffmanChrominanceAC, codewords, prof);
     }
 
   bitWriter.flush(); // now image is completely encoded, write any bits still left in the buffer
