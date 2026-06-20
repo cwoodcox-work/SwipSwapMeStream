@@ -113,9 +113,10 @@ namespace {
     // Core assignment, most-isolated-from-the-game first: cores 0 and 2 leave
     // core 1 (the main game core) freest; a 3rd strip then takes core 1.
     constexpr int kStripCore[3] = {0, 2, 1};
-    // Strips encoded this frame; starts optimistic (all cores) and backs off to
-    // kMinStrips when the core-1 strip is being starved by the game.
-    std::atomic<uint32_t> sActiveStrips{static_cast<uint32_t>(kNumStrips)};
+    // Strips encoded this frame. Starts conservative (kMinStrips: cores 0/2, core 1
+    // left free for the game) and escalates to kNumStrips (adds core 1) only when 2
+    // strips are the bottleneck -- see the adaptive logic in encoderLoop.
+    std::atomic<uint32_t> sActiveStrips{static_cast<uint32_t>(kMinStrips)};
 
     // --- Adaptive quality: bands select resolution (downscale) + the quality
     // range the auto-controller works within. The viewer picks a band; the
@@ -631,7 +632,7 @@ namespace {
         uint32_t statBusyN[3]  = {0, 0, 0};
         uint32_t sLastActiveStrips = 0;     // active strip count of the previous frame
         bool sLastBoxFilter        = false; // downscale filter mode of the previous frame
-        uint32_t probeWindows      = 0;     // stat windows since we backed off
+        uint32_t escalateHold      = 0;     // windows to wait before re-trying the 3rd strip
 
         while (sServerRunning && sStreaming) {
             {
@@ -820,30 +821,38 @@ namespace {
                     sQuality.store(q);
                 }
 
-                // --- Adaptive strip count (core-1 contention control) ---
-                // The 3rd strip runs on core 1 (the game core). Because the
-                // coordinator joins all strips before sending, a 3rd strip that the
-                // game keeps preempting gates the whole frame -- making 3 strips
-                // SLOWER than 2. Detect that by comparing the core-1 strip's encode
-                // wall time to the cores 0/2 strips: if it is >1.5x slower it is
-                // being starved, so back off to kMinStrips. While backed off, probe
-                // the full count again periodically so we recover once the game
-                // closes / goes idle. Only frames the workers actually encoded carry
-                // a usable signal (require a few samples to avoid noise).
+                // --- Adaptive strip count (keep core 1 free for the game) ---
+                // The 3rd strip runs on core 1 (the game core), so by default we use
+                // only kMinStrips (cores 0/2) and leave core 1 to the game. We add
+                // the 3rd strip ONLY when 2 strips are the real bottleneck: the
+                // encoder is saturated (parallel section fills most of the window)
+                // AND the wifi has headroom (few latest-wins drops), so the extra
+                // core would actually raise fps rather than just steal from the game.
+                // We retreat (free core 1 again) if the core-1 strip gets starved by
+                // the game (a2 >> a0/a1 -> hold off longer before retrying), if the
+                // encoder is no longer saturated, or if the wifi has become the limit
+                // (more encode throughput is then moot). After any retreat we wait
+                // STREAM_STRIP_PROBE_SECONDS before probing the 3rd strip again.
                 const uint64_t a0 = statBusyN[0] ? statBusyUs[0] / statBusyN[0] : 0;
                 const uint64_t a1 = statBusyN[1] ? statBusyUs[1] / statBusyN[1] : 0;
                 const uint64_t a2 = statBusyN[2] ? statBusyUs[2] / statBusyN[2] : 0;
-                if (kNumStrips >= 3) {
-                    if (sActiveStrips.load() >= 3) {
-                        const uint64_t other = a0 > a1 ? a0 : a1;
-                        if (statBusyN[0] >= 4 && statBusyN[1] >= 4 && statBusyN[2] >= 4 &&
-                            other > 0 && a2 > other * 3 / 2) {
-                            sActiveStrips.store(static_cast<uint32_t>(kMinStrips));
-                            probeWindows = 0;
+                if (kNumStrips >= 3 && statEnc >= 4) {
+                    const uint64_t dutyPct  = elapsedUs ? statParallelUs * 100 / elapsedUs : 0;
+                    const bool wifiHeadroom = statDropped * 100 < statEnc * 5;
+                    if (sActiveStrips.load() < static_cast<uint32_t>(kNumStrips)) {
+                        if (escalateHold > 0) {
+                            escalateHold--;
+                        } else if (dutyPct >= 85 && wifiHeadroom) {
+                            sActiveStrips.store(static_cast<uint32_t>(kNumStrips)); // encode-bound: add core 1
                         }
-                    } else if (++probeWindows >= STREAM_STRIP_PROBE_SECONDS) {
-                        sActiveStrips.store(static_cast<uint32_t>(kNumStrips));
-                        probeWindows = 0;
+                    } else {
+                        const uint64_t other    = a0 > a1 ? a0 : a1;
+                        const bool core1Starved = statBusyN[0] >= 4 && statBusyN[1] >= 4 &&
+                                                  statBusyN[2] >= 4 && other > 0 && a2 > other * 3 / 2;
+                        if (core1Starved || dutyPct < 70 || !wifiHeadroom) {
+                            sActiveStrips.store(static_cast<uint32_t>(kMinStrips)); // free core 1
+                            escalateHold = STREAM_STRIP_PROBE_SECONDS;
+                        }
                     }
                 }
 
@@ -1020,6 +1029,9 @@ namespace {
             sForceKeyframe.store(true);
             sLastOutW = 0;
             sLastOutH = 0;
+            // Start conservative each connection: cores 0/2 only, core 1 free. The
+            // encoder loop escalates to the 3rd strip only if 2 prove insufficient.
+            sActiveStrips.store(static_cast<uint32_t>(kMinStrips));
 #ifdef TOOJPEG_PROFILE
             sProfileWanted.store(true); // re-arm the one-shot encode profiler
 #endif
