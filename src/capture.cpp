@@ -511,10 +511,10 @@ namespace {
                     TooJpeg::EncodeProfile prof{0, 0, 0};
                     const bool profileThis = sProfileWanted.exchange(false);
                     w.ok                   = TooJpeg::writeJpeg(jpegSinkFn(idx), w.rgb.data(),
-                                              static_cast<unsigned short>(sStripOutW),
-                                              static_cast<unsigned short>(w.h),
-                                              true, static_cast<unsigned char>(sStripQuality), STREAM_JPEG_420,
-                                              nullptr, profileThis ? &prof : nullptr);
+                                                                static_cast<unsigned short>(sStripOutW),
+                                                                static_cast<unsigned short>(w.h),
+                                                                true, static_cast<unsigned char>(sStripQuality), STREAM_JPEG_420,
+                                                                nullptr, profileThis ? &prof : nullptr);
                     if (profileThis && w.ok) {
                         const uint64_t c   = OSTicksToMicroseconds(prof.colorTicks);
                         const uint64_t d   = OSTicksToMicroseconds(prof.dctQuantTicks);
@@ -522,10 +522,10 @@ namespace {
                         const uint64_t tot = c + d + e;
                         const uint64_t den = tot ? tot : 1; // avoid divide-by-zero
                         STREAM_LOG_INFO(
-                            "Encode profile (strip %d, %ux%u q%u 420=%d): color %llu us (%llu%%) | "
-                            "dct+quant %llu us (%llu%%) | entropy %llu us (%llu%%) | phase-sum %llu us",
-                            idx, (unsigned) sStripOutW, (unsigned) w.h, (unsigned) sStripQuality,
-                            (int) STREAM_JPEG_420, c, c * 100 / den, d, d * 100 / den, e, e * 100 / den, tot);
+                                "Encode profile (strip %d, %ux%u q%u 420=%d): color %llu us (%llu%%) | "
+                                "dct+quant %llu us (%llu%%) | entropy %llu us (%llu%%) | phase-sum %llu us",
+                                idx, (unsigned) sStripOutW, (unsigned) w.h, (unsigned) sStripQuality,
+                                (int) STREAM_JPEG_420, c, c * 100 / den, d, d * 100 / den, e, e * 100 / den, tot);
                     }
 #else
                     w.ok = TooJpeg::writeJpeg(jpegSinkFn(idx), w.rgb.data(),
@@ -628,8 +628,8 @@ namespace {
         // if the core-1 strip (idx 2) is much slower than the cores 0/2 strips it
         // is being starved by the game, so back off. Only frames a worker actually
         // encoded are counted (skipped/idle frames carry no signal).
-        uint64_t statBusyUs[3] = {0, 0, 0};
-        uint32_t statBusyN[3]  = {0, 0, 0};
+        uint64_t statBusyUs[3]     = {0, 0, 0};
+        uint32_t statBusyN[3]      = {0, 0, 0};
         uint32_t sLastActiveStrips = 0;     // active strip count of the previous frame
         bool sLastBoxFilter        = false; // downscale filter mode of the previous frame
         uint32_t escalateHold      = 0;     // windows to wait before re-trying the 3rd strip

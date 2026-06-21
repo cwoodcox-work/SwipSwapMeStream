@@ -37,55 +37,55 @@
 
 #include <gx2/surface.h>
 
-#define CAPTURE_TCP_PORT        7766
+#define CAPTURE_TCP_PORT           7766
 
 // --- Protocol handshake (console -> PC, once per connection) ---
 // 4-byte magic "SSMS", this version byte, then native width/height (2 BE each).
 // The viewer refuses/warns on a mismatch instead of misparsing an old or foreign
 // stream. Bump on any wire change; keep in sync with pc-viewer/src/main.rs.
-#define STREAM_PROTOCOL_VERSION 3
+#define STREAM_PROTOCOL_VERSION    3
 
 // Native TV scanout resolution (the Wii U TV scan buffer is a fixed 1280x720;
 // see the verified surface-format note). Sent in the handshake so the viewer
 // upscales encoded -> native regardless of the current adaptive downscale.
-#define STREAM_NATIVE_WIDTH     1280
-#define STREAM_NATIVE_HEIGHT    720
+#define STREAM_NATIVE_WIDTH        1280
+#define STREAM_NATIVE_HEIGHT       720
 
 // --- Per-strip type byte (protocol v2) ---
 // In each per-frame payload, every strip carries a type byte after its
 // [Y][height]. UNCHANGED carries no further payload (the viewer keeps its
 // previous pixels for that strip); JPEG is followed by [4 BE len][jpeg].
-#define STRIP_TYPE_UNCHANGED    0x00
-#define STRIP_TYPE_JPEG         0x01
+#define STRIP_TYPE_UNCHANGED       0x00
+#define STRIP_TYPE_JPEG            0x01
 
 // --- Tunables (sane defaults; edit here). ---
 // Capture 1 out of every STREAM_FRAME_SKIP TV frames (1 => uncapped, up to 60;
 // the encoder/wifi + adaptive quality become the real cap. 2 => ~30 fps).
-#define STREAM_FRAME_SKIP       1
+#define STREAM_FRAME_SKIP          1
 // Use YCbCr 4:2:0 chroma subsampling (smaller frames, minor quality loss).
-#define STREAM_JPEG_420         true
+#define STREAM_JPEG_420            true
 // Max horizontal strips encoded in parallel across the Espresso's cores (max 3).
 // 3 uses all cores: the 3rd strip runs on core 1 (the main game core). The
 // encoder runs this many strips when the game isn't starving that 3rd strip, and
 // adaptively backs off to STREAM_MIN_STRIPS (cores 0 and 2, core 1 left free)
 // when it detects the game contending for core 1.
-#define STREAM_ENCODE_STRIPS    3
+#define STREAM_ENCODE_STRIPS       3
 // Strip count the encoder backs off to under core-1 contention (>= 1, <= max).
-#define STREAM_MIN_STRIPS       2
+#define STREAM_MIN_STRIPS          2
 // While backed off, re-probe the full strip count after this many 1-second stat
 // windows (so the encoder recovers full speed once the game closes / goes idle).
 #define STREAM_STRIP_PROBE_SECONDS 8
 // Default mode at connect: 0 = Performance, 1 = Balanced, 2 = Quality.
-#define STREAM_DEFAULT_MODE     1
+#define STREAM_DEFAULT_MODE        1
 
 // --- Control protocol (PC viewer -> console), single bytes over the TCP link ---
-#define CTRL_MODE_PERFORMANCE   0x01 // low res + low quality band (max framerate)
-#define CTRL_MODE_BALANCED      0x02 // medium res + medium quality band
-#define CTRL_MODE_QUALITY       0x03 // medium res + high quality band
-#define CTRL_AUTO_ON            0x10 // re-enable adaptive quality
-#define CTRL_AUTO_OFF           0x11 // pin current quality (disable adapt)
-#define CTRL_QUALITY_UP         0x20 // nudge quality up (also pins / auto off)
-#define CTRL_QUALITY_DOWN       0x21 // nudge quality down (also pins / auto off)
+#define CTRL_MODE_PERFORMANCE      0x01 // low res + low quality band (max framerate)
+#define CTRL_MODE_BALANCED         0x02 // medium res + medium quality band
+#define CTRL_MODE_QUALITY          0x03 // medium res + high quality band
+#define CTRL_AUTO_ON               0x10 // re-enable adaptive quality
+#define CTRL_AUTO_OFF              0x11 // pin current quality (disable adapt)
+#define CTRL_QUALITY_UP            0x20 // nudge quality up (also pins / auto off)
+#define CTRL_QUALITY_DOWN          0x21 // nudge quality down (also pins / auto off)
 
 #ifdef __cplusplus
 extern "C" {
