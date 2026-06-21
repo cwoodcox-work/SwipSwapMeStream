@@ -12,8 +12,13 @@
  * static regions (HUDs, menus, paused games) cost almost nothing on the wire.
  *
  * Handshake (console -> PC, once per connection, before any frame):
- *   [4 bytes] magic "SSMS"
- *   [1 byte ] protocol version (STREAM_PROTOCOL_VERSION)
+ *   [4 bytes]    magic "SSMS"
+ *   [1 byte ]    protocol version (STREAM_PROTOCOL_VERSION)
+ *   [2 bytes BE] native width  (the TV scanout resolution, e.g. 1280)
+ *   [2 bytes BE] native height (e.g. 720)
+ * Per-frame width/height are the (possibly downscaled) ENCODED dimensions; the
+ * viewer upscales encoded -> native for display. Native is sent once in the
+ * handshake so the viewer's window/upscaler is stable across resolution changes.
  *
  * Stream wire protocol (console -> PC), repeated per frame (see capture.cpp for
  * the multi-strip payload layout). Dimensions are carried in the payload, so the
@@ -35,10 +40,16 @@
 #define CAPTURE_TCP_PORT        7766
 
 // --- Protocol handshake (console -> PC, once per connection) ---
-// 4-byte magic "SSMS" then this version byte. The viewer refuses/warns on a
-// mismatch instead of misparsing an old or foreign stream. Bump on any wire
-// change; keep in sync with pc-viewer/src/main.rs.
-#define STREAM_PROTOCOL_VERSION 2
+// 4-byte magic "SSMS", this version byte, then native width/height (2 BE each).
+// The viewer refuses/warns on a mismatch instead of misparsing an old or foreign
+// stream. Bump on any wire change; keep in sync with pc-viewer/src/main.rs.
+#define STREAM_PROTOCOL_VERSION 3
+
+// Native TV scanout resolution (the Wii U TV scan buffer is a fixed 1280x720;
+// see the verified surface-format note). Sent in the handshake so the viewer
+// upscales encoded -> native regardless of the current adaptive downscale.
+#define STREAM_NATIVE_WIDTH     1280
+#define STREAM_NATIVE_HEIGHT    720
 
 // --- Per-strip type byte (protocol v2) ---
 // In each per-frame payload, every strip carries a type byte after its
@@ -53,10 +64,17 @@
 #define STREAM_FRAME_SKIP       1
 // Use YCbCr 4:2:0 chroma subsampling (smaller frames, minor quality loss).
 #define STREAM_JPEG_420         true
-// Number of horizontal strips encoded in parallel across the Espresso's cores.
-// 2 => cores 0 and 2 (leaves core 1, the main game core, freer). 3 => all cores
-// (faster, but more contention with the game). Max 3.
-#define STREAM_ENCODE_STRIPS    2
+// Max horizontal strips encoded in parallel across the Espresso's cores (max 3).
+// 3 uses all cores: the 3rd strip runs on core 1 (the main game core). The
+// encoder runs this many strips when the game isn't starving that 3rd strip, and
+// adaptively backs off to STREAM_MIN_STRIPS (cores 0 and 2, core 1 left free)
+// when it detects the game contending for core 1.
+#define STREAM_ENCODE_STRIPS    3
+// Strip count the encoder backs off to under core-1 contention (>= 1, <= max).
+#define STREAM_MIN_STRIPS       2
+// While backed off, re-probe the full strip count after this many 1-second stat
+// windows (so the encoder recovers full speed once the game closes / goes idle).
+#define STREAM_STRIP_PROBE_SECONDS 8
 // Default mode at connect: 0 = Performance, 1 = Balanced, 2 = Quality.
 #define STREAM_DEFAULT_MODE     1
 

@@ -6,6 +6,19 @@
 
 #include "toojpeg.h"
 
+// One-shot encode profiler (see toojpeg.h EncodeProfile). Entirely compiled out
+// unless built with -DTOOJPEG_PROFILE, so the normal encoder stays include-free
+// and byte-identical. When enabled, phases accumulate Wii U CPU timebase ticks
+// into the caller's EncodeProfile via OSGetSystemTime().
+#ifdef TOOJPEG_PROFILE
+  #include <coreinit/time.h>
+  #define PROF_START(var)        const long long var = OSGetSystemTime()
+  #define PROF_ADD(field, start) do { if (prof) (prof)->field += (unsigned long long)(OSGetSystemTime() - (start)); } while (0)
+#else
+  #define PROF_START(var)        ((void)0)
+  #define PROF_ADD(field, start) ((void)0)
+#endif
+
 // - the "official" specifications: https://www.w3.org/Graphics/JPEG/itu-t81.pdf and https://www.w3.org/Graphics/JPEG/jfif3.pdf
 // - Wikipedia has a short description of the JFIF/JPEG file format: https://en.wikipedia.org/wiki/JPEG_File_Interchange_Format
 // - the popular STB Image library includes Jon's JPEG encoder as well: https://github.com/nothings/stb/blob/master/stb_image_write.h
@@ -197,19 +210,27 @@ Number clamp(Number value, Limit minValue, Limit maxValue)
   return value;                           // value was inside interval, keep it
 }
 
-// convert from RGB to YCbCr, constants are similar to ITU-R, see https://en.wikipedia.org/wiki/YCbCr#JPEG_conversion
-float rgb2y (float r, float g, float b) { return +0.299f   * r +0.587f   * g +0.114f   * b; }
-float rgb2cb(float r, float g, float b) { return -0.16874f * r -0.33126f * g +0.5f     * b; }
-float rgb2cr(float r, float g, float b) { return +0.5f     * r -0.41869f * g -0.08131f * b; }
+// Fixed-point RGB->YCbCr (perf "Lever #2"). 16-bit coefficients (each triple sums
+// to 65536, so a flat gray maps to Y=input, Cb=Cr=0); constants are libjpeg's.
+// r,g,b are 0..255 and the result is already shifted to JPEG's signed range
+// (Y in -128..127, Cb/Cr centred on 0), matching the old float path within +-1.
+int rgb2y (int r, int g, int b) { return (( 19595*r + 38470*g +  7471*b + 32768) >> 16) - 128; }
+int rgb2cb(int r, int g, int b) { return  (-11059*r - 21709*g + 32768*b + 32768) >> 16; }
+int rgb2cr(int r, int g, int b) { return  ( 32768*r - 27439*g -  5329*b + 32768) >> 16; }
 
-// forward DCT computation "in one dimension" (fast AAN algorithm by Arai, Agui and Nakajima: "A fast DCT-SQ scheme for images")
-void DCT(float block[8*8], uint8_t stride) // stride must be 1 (=horizontal) or 8 (=vertical)
+// Integer forward DCT (libjpeg "ifast" / AAN). Same butterfly structure as the
+// float jfdctflt this replaced, but each rotation multiply is descaled by
+// CONST_BITS so all lanes stay at one integer scale; the AAN per-element scaling
+// is folded into the quantization divisors (see the divisor setup in writeJpeg).
+const int32_t CONST_BITS = 8;
+const int32_t FIX_0_382683433 =  98; // FIX(0.382683433) = sqrt(2 - sqrt(2)) / 2
+const int32_t FIX_0_541196100 = 139; // FIX(0.541196100) = 1 / sqrt(2 - sqrt(2)) ... AAN c3
+const int32_t FIX_0_707106781 = 181; // FIX(0.707106781) = 1 / sqrt(2)
+const int32_t FIX_1_306562965 = 334; // FIX(1.306562965) = cos(pi/8) * sqrt(2)
+inline int32_t imul(int32_t var, int32_t factor) { return (var * factor + (1 << (CONST_BITS - 1))) >> CONST_BITS; }
+
+void DCT(int32_t block[8*8], uint8_t stride) // stride must be 1 (=horizontal) or 8 (=vertical)
 {
-  const auto SqrtHalfSqrt = 1.306562965f; //    sqrt((2 + sqrt(2)) / 2) = cos(pi * 1 / 8) * sqrt(2)
-  const auto InvSqrt      = 0.707106781f; // 1 / sqrt(2)                = cos(pi * 2 / 8)
-  const auto HalfSqrtSqrt = 0.382683432f; //     sqrt(2 - sqrt(2)) / 2  = cos(pi * 3 / 8)
-  const auto InvSqrtSqrt  = 0.541196100f; // 1 / sqrt(2 - sqrt(2))      = cos(pi * 3 / 8) * sqrt(2)
-
   // modify in-place
   auto& block0 = block[0         ];
   auto& block1 = block[1 * stride];
@@ -220,7 +241,7 @@ void DCT(float block[8*8], uint8_t stride) // stride must be 1 (=horizontal) or 
   auto& block6 = block[6 * stride];
   auto& block7 = block[7 * stride];
 
-  // based on https://dev.w3.org/Amaya/libjpeg/jfdctflt.c , the original variable names can be found in my comments
+  // based on https://dev.w3.org/Amaya/libjpeg/jfdctfst.c , the original variable names can be found in my comments
   auto add07 = block0 + block7; auto sub07 = block0 - block7; // tmp0, tmp7
   auto add16 = block1 + block6; auto sub16 = block1 - block6; // tmp1, tmp6
   auto add25 = block2 + block5; auto sub25 = block2 - block5; // tmp2, tmp5
@@ -231,30 +252,42 @@ void DCT(float block[8*8], uint8_t stride) // stride must be 1 (=horizontal) or 
 
   block0 = add0347 + add1256; block4 = add0347 - add1256; // "phase 3"
 
-  auto z1 = (sub16_25 + sub07_34) * InvSqrt; // all temporary z-variables kept their original names
+  auto z1 = imul(sub16_25 + sub07_34, FIX_0_707106781); // all temporary z-variables kept their original names
   block2 = sub07_34 + z1; block6 = sub07_34 - z1; // "phase 5"
 
   auto sub23_45 = sub25 + sub34; // tmp10 ("odd part" / "phase 2")
   auto sub12_56 = sub16 + sub25; // tmp11
   auto sub01_67 = sub16 + sub07; // tmp12
 
-  auto z5 = (sub23_45 - sub01_67) * HalfSqrtSqrt;
-  auto z2 = sub23_45 * InvSqrtSqrt  + z5;
-  auto z3 = sub12_56 * InvSqrt;
-  auto z4 = sub01_67 * SqrtHalfSqrt + z5;
+  auto z5 = imul(sub23_45 - sub01_67, FIX_0_382683433);
+  auto z2 = imul(sub23_45, FIX_0_541196100) + z5;
+  auto z3 = imul(sub12_56, FIX_0_707106781);
+  auto z4 = imul(sub01_67, FIX_1_306562965) + z5;
   auto z6 = sub07 + z3; // z11 ("phase 5")
   auto z7 = sub07 - z3; // z13
   block1 = z6 + z4; block7 = z6 - z4; // "phase 6"
   block5 = z7 + z2; block3 = z7 - z2;
 }
 
-// run DCT, quantize and write Huffman bit codes
-int16_t encodeBlock(BitWriter& writer, float block[8][8], const float scaled[8*8], int16_t lastDC,
-                    const BitCode huffmanDC[256], const BitCode huffmanAC[256], const BitCode* codewords)
+// Quantize one (already DCT-transformed) coefficient: round(coef / divisor) with
+// symmetric rounding for negatives, matching libjpeg's ifast quantizer.
+inline int32_t quantizeCoef(int32_t coef, int32_t divisor)
 {
-  // "linearize" the 8x8 block, treat it as a flat array of 64 floats
-  auto block64 = (float*) block;
+  if (coef < 0) { coef = -coef; coef += divisor >> 1; coef /= divisor; return -coef; }
+  coef += divisor >> 1; coef /= divisor; return coef;
+}
 
+// run DCT, quantize and write Huffman bit codes
+int16_t encodeBlock(BitWriter& writer, int32_t block[8][8], const int32_t divisors[8*8], int16_t lastDC,
+                    const BitCode huffmanDC[256], const BitCode huffmanAC[256], const BitCode* codewords,
+                    TooJpeg::EncodeProfile* prof = nullptr)
+{
+  (void)prof; // unused unless built with -DTOOJPEG_PROFILE
+
+  // "linearize" the 8x8 block, treat it as a flat array of 64 ints
+  auto block64 = (int32_t*) block;
+
+  PROF_START(tDct);
   // DCT: rows
   for (auto offset = 0; offset < 8; offset++)
     DCT(block64 + offset*8, 1);
@@ -262,25 +295,22 @@ int16_t encodeBlock(BitWriter& writer, float block[8][8], const float scaled[8*8
   for (auto offset = 0; offset < 8; offset++)
     DCT(block64 + offset*1, 8);
 
-  // scale
-  for (auto i = 0; i < 8*8; i++)
-    block64[i] *= scaled[i];
-
   // encode DC (the first coefficient is the "average color" of the 8x8 block)
-  auto DC = int(block64[0] + (block64[0] >= 0 ? +0.5f : -0.5f)); // C++11's nearbyint() achieves a similar effect
+  auto DC = quantizeCoef(block64[0], divisors[0]);
 
   // quantize and zigzag the other 63 coefficients
   auto posNonZero = 0; // find last coefficient which is not zero (because trailing zeros are encoded differently)
   int16_t quantized[8*8];
   for (auto i = 1; i < 8*8; i++) // start at 1 because block64[0]=DC was already processed
   {
-    auto value = block64[ZigZagInv[i]];
-    // round to nearest integer
-    quantized[i] = int(value + (value >= 0 ? +0.5f : -0.5f)); // C++11's nearbyint() achieves a similar effect
+    quantized[i] = static_cast<int16_t>(quantizeCoef(block64[ZigZagInv[i]], divisors[ZigZagInv[i]]));
     // remember offset of last non-zero coefficient
     if (quantized[i] != 0)
       posNonZero = i;
   }
+
+  PROF_ADD(dctQuantTicks, tDct);
+  PROF_START(tEnt);
 
   // same "average color" as previous block ?
   auto diff = DC - lastDC;
@@ -319,6 +349,8 @@ int16_t encodeBlock(BitWriter& writer, float block[8][8], const float scaled[8*8
   if (posNonZero < 8*8 - 1) // = 63
     writer << huffmanAC[0x00];
 
+  PROF_ADD(entropyTicks, tEnt);
+
   return DC;
 }
 
@@ -347,8 +379,10 @@ namespace TooJpeg
 {
 // the only exported function ...
 bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width, unsigned short height,
-               bool isRGB, unsigned char quality_, bool downsample, const char* comment)
+               bool isRGB, unsigned char quality_, bool downsample, const char* comment, EncodeProfile* prof)
 {
+  (void)prof; // unused unless built with -DTOOJPEG_PROFILE
+
   // reject invalid pointers
   if (output == nullptr || pixels_ == nullptr)
     return false;
@@ -502,9 +536,13 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
   bitWriter << Spectral;
 
   // ////////////////////////////////////////
-  // adjust quantization tables with AAN scaling factors to simplify DCT
-  float scaledLuminance  [8*8];
-  float scaledChrominance[8*8];
+  // integer quantization divisors, folding the AAN DCT scaling into the quant step.
+  // For the integer (ifast) DCT, quantizeCoef(coef, divisor) = round(coef/divisor)
+  // reproduces the old float "coef * 1/(AanScaleFactor[row]*AanScaleFactor[col]*8*quant)",
+  // so divisor = AanScaleFactor[row]*AanScaleFactor[col]*8*quant. Computed once per
+  // image (this float math is not on the per-block hot path).
+  int32_t divisorsLuminance  [8*8];
+  int32_t divisorsChrominance[8*8];
   for (auto i = 0; i < 8*8; i++)
   {
     auto row    = ZigZagInv[i] / 8; // same as ZigZagInv[i] >> 3
@@ -512,13 +550,11 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
 
     // scaling constants for AAN DCT algorithm: AanScaleFactors[0] = 1, AanScaleFactors[k=1..7] = cos(k*PI/16) * sqrt(2)
     static const float AanScaleFactors[8] = { 1, 1.387039845f, 1.306562965f, 1.175875602f, 1, 0.785694958f, 0.541196100f, 0.275899379f };
-    auto factor = 1 / (AanScaleFactors[row] * AanScaleFactors[column] * 8);
-    scaledLuminance  [ZigZagInv[i]] = factor / quantLuminance  [i];
-    scaledChrominance[ZigZagInv[i]] = factor / quantChrominance[i];
-    // if you really want JPEGs that are bitwise identical to Jon Olick's code then you need slightly different formulas (note: sqrt(8) = 2.828427125f)
-    //static const float aasf[] = { 1.0f * 2.828427125f, 1.387039845f * 2.828427125f, 1.306562965f * 2.828427125f, 1.175875602f * 2.828427125f, 1.0f * 2.828427125f, 0.785694958f * 2.828427125f, 0.541196100f * 2.828427125f, 0.275899379f * 2.828427125f }; // line 240 of jo_jpeg.cpp
-    //scaledLuminance  [ZigZagInv[i]] = 1 / (quantLuminance  [i] * aasf[row] * aasf[column]); // lines 266-267 of jo_jpeg.cpp
-    //scaledChrominance[ZigZagInv[i]] = 1 / (quantChrominance[i] * aasf[row] * aasf[column]);
+    auto aan = AanScaleFactors[row] * AanScaleFactors[column] * 8;
+    int32_t dLum = static_cast<int32_t>(aan * quantLuminance  [i] + 0.5f);
+    int32_t dChr = static_cast<int32_t>(aan * quantChrominance[i] + 0.5f);
+    divisorsLuminance  [ZigZagInv[i]] = dLum < 1 ? 1 : dLum; // never 0 (would divide by zero)
+    divisorsChrominance[ZigZagInv[i]] = dChr < 1 ? 1 : dChr;
   }
 
   // ////////////////////////////////////////
@@ -553,8 +589,8 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
 
   // average color of the previous MCU
   int16_t lastYDC = 0, lastCbDC = 0, lastCrDC = 0;
-  // convert from RGB to YCbCr
-  float Y[8][8], Cb[8][8], Cr[8][8];
+  // convert from RGB to YCbCr (integer blocks fed to the integer DCT)
+  int32_t Y[8][8], Cb[8][8], Cr[8][8];
 
   for (auto mcuY = 0; mcuY < height; mcuY += mcuSize) // each step is either 8 or 16 (=mcuSize)
     for (auto mcuX = 0; mcuX < width; mcuX += mcuSize)
@@ -565,6 +601,7 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
         for (auto blockX = 0; blockX < mcuSize; blockX += 8)
         {
           // now we finally have an 8x8 block ...
+          PROF_START(tCol);
           for (auto deltaY = 0; deltaY < 8; deltaY++)
           {
             auto column = minimum(mcuX + blockX         , maxWidth); // must not exceed image borders, replicate last row/column if needed
@@ -579,7 +616,7 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
               // grayscale images have solely a Y channel which can be easily derived from the input pixel by shifting it by 128
               if (!isRGB)
               {
-                Y[deltaY][deltaX] = pixels[pixelPos] - 128.f;
+                Y[deltaY][deltaX] = pixels[pixelPos] - 128;
                 continue;
               }
 
@@ -588,7 +625,7 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
               auto g = pixels[3 * pixelPos + 1];
               auto b = pixels[3 * pixelPos + 2];
 
-              Y   [deltaY][deltaX] = rgb2y (r, g, b) - 128; // again, the JPEG standard requires Y to be shifted by 128
+              Y   [deltaY][deltaX] = rgb2y (r, g, b); // rgb2y already applies the JPEG -128 level shift
               // YCbCr444 is easy - the more complex YCbCr420 has to be computed about 20 lines below in a second pass
               if (!downsample)
               {
@@ -597,9 +634,10 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
               }
             }
           }
+          PROF_ADD(colorTicks, tCol);
 
         // encode Y channel
-        lastYDC = encodeBlock(bitWriter, Y, scaledLuminance, lastYDC, huffmanLuminanceDC, huffmanLuminanceAC, codewords);
+        lastYDC = encodeBlock(bitWriter, Y, divisorsLuminance, lastYDC, huffmanLuminanceDC, huffmanLuminanceAC, codewords, prof);
         // Cb and Cr are encoded about 50 lines below
       }
 
@@ -610,6 +648,7 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
       // ////////////////////////////////////////
       // the following lines are only relevant for YCbCr420:
       // average/downsample chrominance of four pixels while respecting the image borders
+      PROF_START(tChroma);
       if (downsample)
         for (short deltaY = 7; downsample && deltaY >= 0; deltaY--) // iterating loop in reverse increases cache read efficiency
         {
@@ -649,10 +688,11 @@ bool writeJpeg(WRITE_ONE_BYTE output, const void* pixels_, unsigned short width,
             }
           }
         } // end of YCbCr420 code for Cb and Cr
+      PROF_ADD(colorTicks, tChroma);
 
       // encode Cb and Cr
-      lastCbDC = encodeBlock(bitWriter, Cb, scaledChrominance, lastCbDC, huffmanChrominanceDC, huffmanChrominanceAC, codewords);
-      lastCrDC = encodeBlock(bitWriter, Cr, scaledChrominance, lastCrDC, huffmanChrominanceDC, huffmanChrominanceAC, codewords);
+      lastCbDC = encodeBlock(bitWriter, Cb, divisorsChrominance, lastCbDC, huffmanChrominanceDC, huffmanChrominanceAC, codewords, prof);
+      lastCrDC = encodeBlock(bitWriter, Cr, divisorsChrominance, lastCrDC, huffmanChrominanceDC, huffmanChrominanceAC, codewords, prof);
     }
 
   bitWriter.flush(); // now image is completely encoded, write any bits still left in the buffer
